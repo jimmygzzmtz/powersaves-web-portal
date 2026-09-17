@@ -6,451 +6,466 @@
 // - Amiibo metadata & artwork from AmiiboAPI (https://github.com/N3evin/AmiiboAPI)
 
 import { render } from 'preact';
-import { useState, useEffect, useRef } from 'preact/hooks';
+import { signal, computed, effect } from '@preact/signals';
 import { html } from 'htm/preact';
 import { Portal, NTAG215_SIZE } from './portal.js';
 import { parseAmiibo, formatHexDump, fetchAmiiboMetadata, downloadBin, toHex, formatUid } from './amiibo.js';
 
-export function App() {
-  const portalRef = useRef(new Portal());
-  const [device, setDevice] = useState({ connected: false, name: '', vendorId: '', productId: '' });
-  const [status, setStatus] = useState({ text: 'Portal Disconnected', type: 'info' });
-  const [logs, setLogs] = useState([]);
-  const [toasts, setToasts] = useState([]);
+// Hardware Portal Instance
+const portal = new Portal();
 
-  // Tag resting on the portal hardware
-  const [activeTag, setActiveTag] = useState({
-    raw: null,
-    parsed: null,
-    metadata: null,
-    isReading: false,
+// Reactive State Signals (No Hooks)
+const device = signal({ connected: false, name: '', vendorId: '', productId: '' });
+const status = signal({ text: 'Portal Disconnected', type: 'info' });
+const logs = signal([]);
+const toasts = signal([]);
+
+// Tag resting on the portal hardware
+const activeTag = signal({
+  raw: null,
+  parsed: null,
+  metadata: null,
+  isReading: false,
+});
+
+// Staged dump file to write
+const stagedFile = signal({
+  filename: '',
+  raw: null,
+  parsed: null,
+  metadata: null,
+  error: null,
+});
+
+// Write operation state
+const writing = signal({
+  active: false,
+  progress: 0,
+  total: 100,
+  label: '',
+});
+
+// Modal dialog state
+const modal = signal({
+  open: false,
+  type: 'analysis',
+  title: '',
+  message: '',
+  mode: 'full',
+});
+
+// Unified Lower Deck Navigation Signals
+const deckTab = signal('hex'); // 'hex' | 'console'
+const hexSource = signal('tag'); // 'tag' | 'staged'
+const logFilter = signal('all'); // 'all' | 'nfc' | 'write'
+const copiedLog = signal(false);
+
+// Toast Notification System
+const showToast = (text, type = 'info') => {
+  const id = Date.now() + Math.random();
+  toasts.value = [...toasts.value, { id, text, type }];
+  setTimeout(() => {
+    toasts.value = toasts.value.filter((t) => t.id !== id);
+  }, 4000);
+};
+
+// Activity Log Writer
+const addLog = (msg) => {
+  const time = new Date().toLocaleTimeString();
+  let category = 'sys';
+  if (msg.includes('USB') || msg.includes('Connected') || msg.includes('WebHID')) category = 'usb';
+  else if (msg.includes('Token') || msg.includes('tag') || msg.includes('Tag') || msg.includes('NFC') || msg.includes('handshake')) category = 'nfc';
+  else if (msg.includes('Write') || msg.includes('Writing') || msg.includes('flash') || msg.includes('Flash')) category = 'write';
+  else if (msg.includes('verif') || msg.includes('Complete') || msg.includes('SUCCESS')) category = 'ok';
+  if (msg.includes('Error') || msg.includes('error') || msg.includes('failed') || msg.includes('mismatch')) category = 'err';
+
+  logs.value = [{ id: Date.now() + Math.random(), time, category, text: msg }, ...logs.value.slice(0, 149)];
+};
+
+const handleCopyLog = () => {
+  if (!logs.value || logs.value.length === 0) return;
+  const text = logs.value
+    .slice()
+    .reverse()
+    .map((l) => `[${l.time}] [${l.category.toUpperCase()}] ${l.text}`)
+    .join('\n');
+  navigator.clipboard.writeText(text).then(() => {
+    copiedLog.value = true;
+    showToast('Activity log copied to clipboard', 'success');
+    setTimeout(() => {
+      copiedLog.value = false;
+    }, 2000);
   });
+};
 
-  // Staged dump file to write
-  const [stagedFile, setStagedFile] = useState({
-    filename: '',
-    raw: null,
-    parsed: null,
-    metadata: null,
-    error: null,
-  });
+// Connect / Disconnect Portal Hardware
+const handleToggleConnect = async () => {
+  if (device.value.connected) {
+    portal.disconnect();
+    device.value = { connected: false, name: '', vendorId: '', productId: '' };
+    status.value = { text: 'Portal Disconnected', type: 'info' };
+    activeTag.value = { raw: null, parsed: null, metadata: null, isReading: false };
+    addLog('Disconnected from portal.');
+    showToast('Portal disconnected', 'info');
+    return;
+  }
 
-  // Write operation state
-  const [writing, setWriting] = useState({
-    active: false,
+  try {
+    status.value = { text: 'Selecting portal device...', type: 'info' };
+    const dev = await portal.connect({
+      onDisconnect: () => {
+        device.value = { connected: false, name: '', vendorId: '', productId: '' };
+        status.value = { text: 'Portal Disconnected', type: 'error' };
+        activeTag.value = { raw: null, parsed: null, metadata: null, isReading: false };
+        addLog('Portal unplugged.');
+        showToast('Portal hardware unplugged', 'error');
+      },
+      onLog: addLog,
+    });
+
+    device.value = {
+      connected: true,
+      name: dev.productName,
+      vendorId: dev.vendorId,
+      productId: dev.productId,
+    };
+    status.value = { text: 'Portal Ready', type: 'success' };
+    addLog(`Connected: ${dev.productName} (${dev.vendorId}:${dev.productId})`);
+    showToast(`Connected to ${dev.productName || 'PowerSaves Portal'}`, 'success');
+  } catch (err) {
+    status.value = { text: `Connection failed: ${err.message}`, type: 'error' };
+    addLog(`Error: ${err.message}`);
+    showToast(err.message, 'error');
+  }
+};
+
+// Background Tag Polling Loop using Preact Signals Effect
+effect(() => {
+  if (!device.value.connected || writing.value.active) {
+    return;
+  }
+
+  let timer = null;
+  let isCancelled = false;
+  let pollState = 'polling';
+  let failedUid = null;
+
+  const poll = async () => {
+    if (isCancelled) return;
+
+    if (!portal.isConnected || portal.isBusy || pollState === 'reading' || writing.value.active) {
+      if (!isCancelled) timer = setTimeout(poll, 300);
+      return;
+    }
+
+    try {
+      if (pollState === 'polling') {
+        const { found, uid } = await portal.pollOnce();
+        const uidHex = uid ? toHex(uid) : null;
+
+        if (found && uidHex && uidHex !== failedUid) {
+          pollState = 'reading';
+          activeTag.value = { ...activeTag.value, isReading: true };
+          status.value = { text: `Reading tag (${uidHex})...`, type: 'info' };
+          addLog(`Token detected: ${uidHex}. Performing handshake...`);
+
+          try {
+            await portal.initDance(uid);
+            const data = await portal.readTokenWithValidation((cur, tot, step) => {
+              status.value = { text: `Reading tag: ${step} (${Math.round((cur / tot) * 100)}%)`, type: 'info' };
+            });
+
+            const parsed = parseAmiibo(data);
+            let meta = null;
+            if (parsed.isAmiibo && parsed.modelInfo) {
+              meta = await fetchAmiiboMetadata(parsed.modelInfo);
+            }
+
+            activeTag.value = {
+              raw: data,
+              parsed,
+              metadata: meta,
+              isReading: false,
+            };
+
+            failedUid = null;
+            pollState = 'done';
+            const charName = meta?.name || (parsed.isAmiibo ? parsed.modelInfo?.seriesName : 'NFC Tag');
+            status.value = { text: `Tag verified: ${charName}`, type: 'success' };
+            addLog(`Read complete: ${parsed.uidFormatted} (${charName})`);
+            showToast(`Verified: ${charName}`, 'success');
+          } catch (readErr) {
+            addLog(`Read error: ${readErr.message}`);
+            failedUid = uidHex;
+            pollState = 'failed';
+            status.value = { text: 'Tag read incomplete. Ready to flash fresh dump.', type: 'error' };
+            activeTag.value = {
+              raw: null,
+              parsed: { uidHex, uidFormatted: formatUid(uid), uidValid: true, isAmiibo: false },
+              metadata: null,
+              isReading: false,
+            };
+            addLog('Tag is resting on portal. Click Flash / Recover Power Tag to write.');
+          }
+        } else if (!found && failedUid) {
+          failedUid = null;
+          pollState = 'polling';
+          activeTag.value = { raw: null, parsed: null, metadata: null, isReading: false };
+          await portal.ledOff();
+          status.value = { text: 'Portal Ready', type: 'info' };
+          addLog('Token removed.');
+        }
+      } else if (pollState === 'done' || pollState === 'failed') {
+        const { found } = await portal.pollOnce();
+        if (!found) {
+          pollState = 'polling';
+          failedUid = null;
+          activeTag.value = { raw: null, parsed: null, metadata: null, isReading: false };
+          await portal.ledOff();
+          status.value = { text: 'Portal Ready', type: 'info' };
+          addLog('Token removed.');
+        }
+      }
+    } catch (pollErr) {
+      // Suppress transient poll error
+    }
+
+    if (!isCancelled) {
+      const delay = pollState === 'done' || pollState === 'failed' ? 400 : 200;
+      timer = setTimeout(poll, delay);
+    }
+  };
+
+  timer = setTimeout(poll, 150);
+
+  return () => {
+    isCancelled = true;
+    if (timer) clearTimeout(timer);
+  };
+});
+
+// Load .bin Dump for Flashing
+const handleFileLoad = async (file) => {
+  if (!file) return;
+
+  try {
+    addLog(`Analyzing dump: ${file.name} (${file.size} B)...`);
+    const buffer = new Uint8Array(await file.arrayBuffer());
+
+    if (buffer.length !== NTAG215_SIZE) {
+      throw new Error(`Expected 540-byte dump, got ${buffer.length} bytes.`);
+    }
+
+    const parsed = parseAmiibo(buffer);
+    let meta = null;
+    if (parsed.isAmiibo && parsed.modelInfo) {
+      meta = await fetchAmiiboMetadata(parsed.modelInfo);
+    }
+
+    stagedFile.value = {
+      filename: file.name,
+      raw: buffer,
+      parsed,
+      metadata: meta,
+      error: null,
+    };
+    hexSource.value = 'staged';
+
+    const charName = meta?.name || (parsed.isAmiibo ? `${parsed.modelInfo?.seriesName} Amiibo` : 'Standard Tag');
+    addLog(`Dump Staged: ${charName} (UID: ${parsed.uidFormatted})`);
+    showToast(`Staged: ${charName}`, 'success');
+
+    modal.value = {
+      open: true,
+      type: 'analysis',
+      title: 'Amiibo Identified — Flash to Tag?',
+      message: '',
+      mode: 'full',
+    };
+  } catch (err) {
+    stagedFile.value = {
+      filename: file.name,
+      raw: null,
+      parsed: null,
+      metadata: null,
+      error: err.message,
+    };
+    addLog(`File error: ${err.message}`);
+    showToast(err.message, 'error');
+  }
+};
+
+const handleDrop = (e) => {
+  e.preventDefault();
+  if (e.dataTransfer.files && e.dataTransfer.files[0]) {
+    handleFileLoad(e.dataTransfer.files[0]);
+  }
+};
+
+// Download Active Tag .bin
+const handleDownloadActive = () => {
+  const current = activeTag.value;
+  if (!current.raw || !current.parsed) return;
+  const name = current.metadata?.name || current.parsed.modelInfo?.seriesName || 'Amiibo';
+  const cleanName = name.replace(/[^a-zA-Z0-9_\- ]/g, '').replace(/\s+/g, '_');
+  const filename = `${cleanName}_${current.parsed.uidHex}.bin`;
+  downloadBin(current.raw, filename);
+  addLog(`Dump exported: ${filename}`);
+  showToast(`Saved ${filename}`, 'success');
+};
+
+// Manual Re-Read
+const handleRetryRead = async () => {
+  if (!device.value.connected || !portal.isConnected) return;
+  if (portal.isBusy || writing.value.active) return;
+
+  try {
+    activeTag.value = { ...activeTag.value, isReading: true };
+    status.value = { text: 'Re-reading tag...', type: 'info' };
+    addLog('Re-reading tag with safe pacing...');
+
+    const { found, uid } = await portal.pollOnce();
+    if (!found || !uid) {
+      throw new Error('No tag detected on portal base.');
+    }
+
+    await portal.initDance(uid);
+    const data = await portal.readTokenWithValidation((cur, tot, step) => {
+      status.value = { text: `Reading tag: ${step} (${Math.round((cur / tot) * 100)}%)`, type: 'info' };
+    });
+
+    const parsed = parseAmiibo(data);
+    let meta = null;
+    if (parsed.isAmiibo && parsed.modelInfo) {
+      meta = await fetchAmiiboMetadata(parsed.modelInfo);
+    }
+
+    activeTag.value = {
+      raw: data,
+      parsed,
+      metadata: meta,
+      isReading: false,
+    };
+
+    const charName = meta?.name || (parsed.isAmiibo ? parsed.modelInfo?.seriesName : 'NFC Tag');
+    status.value = { text: `Tag verified: ${charName}`, type: 'success' };
+    addLog(`Read complete: ${parsed.uidFormatted} (${charName})`);
+    showToast(`Verified: ${charName}`, 'success');
+  } catch (err) {
+    activeTag.value = { ...activeTag.value, isReading: false };
+    status.value = { text: `Read failed: ${err.message}`, type: 'error' };
+    addLog(`Read error: ${err.message}`);
+    showToast(err.message, 'error');
+  }
+};
+
+// Confirmation Modal Trigger
+const promptWrite = (mode) => {
+  if (!device.value.connected) {
+    showToast('Connect portal hardware first', 'error');
+    return;
+  }
+  if (!stagedFile.value.raw || !stagedFile.value.parsed) {
+    showToast('Stage a 540-byte .bin dump file first', 'error');
+    return;
+  }
+
+  const stagedName = stagedFile.value.metadata?.name || 'Amiibo dump';
+  const currentName = activeTag.value.metadata?.name || 'Current tag';
+
+  if (mode === 'userdata') {
+    if (!activeTag.value.raw) {
+      showToast('Place an Amiibo on the portal first to restore userdata', 'error');
+      return;
+    }
+    const idMatch = activeTag.value.parsed.modelInfo?.idHex === stagedFile.value.parsed.modelInfo?.idHex;
+    modal.value = {
+      open: true,
+      type: 'confirm',
+      mode: 'userdata',
+      title: 'Restore User Save Data Only',
+      message: idMatch
+        ? `Write user save data from "${stagedName}" to "${currentName}"? Only pages 0x04–0x81 will be written. Header, UID, and lock bytes will remain untouched.`
+        : `CAUTION: Character ID on staged file (${stagedFile.value.parsed.modelInfo?.idHex}) does not match tag on portal (${activeTag.value.parsed.modelInfo?.idHex})! Restoring mismatched user save data can invalidate cryptographic HMACs. Proceed?`,
+    };
+  } else {
+    modal.value = {
+      open: true,
+      type: 'confirm',
+      mode: 'full',
+      title: activeTag.value.raw ? 'Full Power Tag Rewrite' : 'Flash / Recover Power Tag',
+      message: activeTag.value.raw
+        ? `This will completely overwrite the Power Tag with "${stagedName}" (UID: ${stagedFile.value.parsed.uidHex}), rewriting all 135 pages (0x00 to 0x86). Ensure your tag is a rewritable Datel Power Tag (PUC). Continue?`
+        : `Ensure your Power Tag is placed on the portal base. This will execute the unlock handshake (0x1b) and write all 540 bytes of "${stagedName}", completely restoring the tag. Continue?`,
+    };
+  }
+};
+
+// Execute Write
+const executeWrite = async (modeOverride) => {
+  const mode = modeOverride || modal.value.mode;
+  modal.value = { open: false, type: 'confirm', title: '', message: '', mode: 'full' };
+
+  writing.value = {
+    active: true,
     progress: 0,
     total: 100,
-    label: '',
-  });
-
-  // Modal dialog state
-  const [modal, setModal] = useState({
-    open: false,
-    type: 'analysis',
-    title: '',
-    message: '',
-    mode: 'full',
-  });
-
-  // Unified Lower Deck Navigation
-  const [deckTab, setDeckTab] = useState('hex'); // 'hex' | 'console'
-  const [hexSource, setHexSource] = useState('tag'); // 'tag' | 'staged'
-  const [logFilter, setLogFilter] = useState('all'); // 'all' | 'nfc' | 'write'
-  const [copiedLog, setCopiedLog] = useState(false);
-
-  // Toast Notification System
-  const showToast = (text, type = 'info') => {
-    const id = Date.now() + Math.random();
-    setToasts((prev) => [...prev, { id, text, type }]);
-    setTimeout(() => {
-      setToasts((prev) => prev.filter((t) => t.id !== id));
-    }, 4000);
+    label: 'Initializing write sequence...',
   };
+  status.value = { text: 'Writing to tag — do not remove tag...', type: 'busy' };
+  addLog(`Starting ${mode === 'full' ? 'Full Power Tag Write' : 'Userdata Restore'}...`);
 
-  // Activity Log Writer
-  const addLog = (msg) => {
-    const time = new Date().toLocaleTimeString();
-    let category = 'sys';
-    if (msg.includes('USB') || msg.includes('Connected') || msg.includes('WebHID')) category = 'usb';
-    else if (msg.includes('Token') || msg.includes('tag') || msg.includes('Tag') || msg.includes('NFC') || msg.includes('handshake')) category = 'nfc';
-    else if (msg.includes('Write') || msg.includes('Writing') || msg.includes('flash') || msg.includes('Flash')) category = 'write';
-    else if (msg.includes('verif') || msg.includes('Complete') || msg.includes('SUCCESS')) category = 'ok';
-    if (msg.includes('Error') || msg.includes('error') || msg.includes('failed') || msg.includes('mismatch')) category = 'err';
-
-    setLogs((prev) => [{ id: Date.now() + Math.random(), time, category, text: msg }, ...prev.slice(0, 149)]);
-  };
-
-  const handleCopyLog = () => {
-    if (!logs || logs.length === 0) return;
-    const text = logs
-      .slice()
-      .reverse()
-      .map((l) => `[${l.time}] [${l.category.toUpperCase()}] ${l.text}`)
-      .join('\n');
-    navigator.clipboard.writeText(text).then(() => {
-      setCopiedLog(true);
-      showToast('Activity log copied to clipboard', 'success');
-      setTimeout(() => setCopiedLog(false), 2000);
+  try {
+    const verifiedData = await portal.writeToken(stagedFile.value.raw, {
+      userdataOnly: mode === 'userdata',
+      onProgress: (cur, tot, lbl) => {
+        writing.value = {
+          active: true,
+          progress: cur,
+          total: tot,
+          label: lbl,
+        };
+      },
     });
-  };
 
-  // Connect / Disconnect Portal Hardware
-  const handleToggleConnect = async () => {
-    const portal = portalRef.current;
-    if (device.connected) {
-      portal.disconnect();
-      setDevice({ connected: false, name: '', vendorId: '', productId: '' });
-      setStatus({ text: 'Portal Disconnected', type: 'info' });
-      setActiveTag({ raw: null, parsed: null, metadata: null, isReading: false });
-      addLog('Disconnected from portal.');
-      showToast('Portal disconnected', 'info');
-      return;
-    }
-
-    try {
-      setStatus({ text: 'Selecting portal device...', type: 'info' });
-      const dev = await portal.connect({
-        onDisconnect: () => {
-          setDevice({ connected: false, name: '', vendorId: '', productId: '' });
-          setStatus({ text: 'Portal Disconnected', type: 'error' });
-          setActiveTag({ raw: null, parsed: null, metadata: null, isReading: false });
-          addLog('Portal unplugged.');
-          showToast('Portal hardware unplugged', 'error');
-        },
-        onLog: addLog,
-      });
-
-      setDevice({
-        connected: true,
-        name: dev.productName,
-        vendorId: dev.vendorId,
-        productId: dev.productId,
-      });
-      setStatus({ text: 'Portal Ready', type: 'success' });
-      addLog(`Connected: ${dev.productName} (${dev.vendorId}:${dev.productId})`);
-      showToast(`Connected to ${dev.productName || 'PowerSaves Portal'}`, 'success');
-    } catch (err) {
-      setStatus({ text: `Connection failed: ${err.message}`, type: 'error' });
-      addLog(`Error: ${err.message}`);
-      showToast(err.message, 'error');
-    }
-  };
-
-  // Background Tag Polling Loop
-  useEffect(() => {
-    let timer = null;
-    let isCancelled = false;
-    let pollState = 'polling';
-    let failedUid = null;
-
-    const poll = async () => {
-      if (isCancelled) return;
-      const portal = portalRef.current;
-
-      if (!portal.isConnected || portal.isBusy || pollState === 'reading' || writing.active) {
-        if (!isCancelled) timer = setTimeout(poll, 300);
-        return;
-      }
-
-      try {
-        if (pollState === 'polling') {
-          const { found, uid } = await portal.pollOnce();
-          const uidHex = uid ? toHex(uid) : null;
-
-          if (found && uidHex && uidHex !== failedUid) {
-            pollState = 'reading';
-            setActiveTag((prev) => ({ ...prev, isReading: true }));
-            setStatus({ text: `Reading tag (${uidHex})...`, type: 'info' });
-            addLog(`Token detected: ${uidHex}. Performing handshake...`);
-
-            try {
-              await portal.initDance(uid);
-              const data = await portal.readTokenWithValidation((cur, tot, step) => {
-                setStatus({ text: `Reading tag: ${step} (${Math.round((cur / tot) * 100)}%)`, type: 'info' });
-              });
-
-              const parsed = parseAmiibo(data);
-              let meta = null;
-              if (parsed.isAmiibo && parsed.modelInfo) {
-                meta = await fetchAmiiboMetadata(parsed.modelInfo);
-              }
-
-              setActiveTag({
-                raw: data,
-                parsed,
-                metadata: meta,
-                isReading: false,
-              });
-
-              failedUid = null;
-              pollState = 'done';
-              const charName = meta?.name || (parsed.isAmiibo ? parsed.modelInfo?.seriesName : 'NFC Tag');
-              setStatus({ text: `Tag verified: ${charName}`, type: 'success' });
-              addLog(`Read complete: ${parsed.uidFormatted} (${charName})`);
-              showToast(`Verified: ${charName}`, 'success');
-            } catch (readErr) {
-              addLog(`Read error: ${readErr.message}`);
-              failedUid = uidHex;
-              pollState = 'failed';
-              setStatus({ text: 'Tag read incomplete. Ready to flash fresh dump.', type: 'error' });
-              setActiveTag({
-                raw: null,
-                parsed: { uidHex, uidFormatted: formatUid(uid), uidValid: true, isAmiibo: false },
-                metadata: null,
-                isReading: false,
-              });
-              addLog('Tag is resting on portal. Click Flash / Recover Power Tag to write.');
-            }
-          } else if (!found && failedUid) {
-            failedUid = null;
-            pollState = 'polling';
-            setActiveTag({ raw: null, parsed: null, metadata: null, isReading: false });
-            await portal.ledOff();
-            setStatus({ text: 'Portal Ready', type: 'info' });
-            addLog('Token removed.');
-          }
-        } else if (pollState === 'done' || pollState === 'failed') {
-          const { found } = await portal.pollOnce();
-          if (!found) {
-            pollState = 'polling';
-            failedUid = null;
-            setActiveTag({ raw: null, parsed: null, metadata: null, isReading: false });
-            await portal.ledOff();
-            setStatus({ text: 'Portal Ready', type: 'info' });
-            addLog('Token removed.');
-          }
-        }
-      } catch (pollErr) {
-        // Suppress transient poll error
-      }
-
-      if (!isCancelled) {
-        const delay = pollState === 'done' || pollState === 'failed' ? 400 : 200;
-        timer = setTimeout(poll, delay);
-      }
+    const parsed = parseAmiibo(verifiedData);
+    activeTag.value = {
+      raw: verifiedData,
+      parsed,
+      metadata: stagedFile.value.metadata,
+      isReading: false,
     };
 
-    if (device.connected) {
-      timer = setTimeout(poll, 150);
-    }
+    status.value = { text: 'Write & verification successful!', type: 'success' };
+    addLog(`Write SUCCESS: Tag verified against ${stagedFile.value.filename}!`);
+    showToast(`Flashed "${stagedFile.value.metadata?.name || 'Amiibo'}" successfully!`, 'success');
+  } catch (err) {
+    status.value = { text: `Write failed: ${err.message}`, type: 'error' };
+    addLog(`WRITE ERROR: ${err.message}`);
+    showToast(`Write error: ${err.message}`, 'error');
+  } finally {
+    writing.value = { active: false, progress: 0, total: 100, label: '' };
+  }
+};
 
-    return () => {
-      isCancelled = true;
-      if (timer) clearTimeout(timer);
-    };
-  }, [device.connected, writing.active]);
+export function App() {
+  const currentDev = device.value;
+  const currentStatus = status.value;
+  const currentActive = activeTag.value;
+  const currentStaged = stagedFile.value;
+  const currentWriting = writing.value;
+  const currentModal = modal.value;
+  const currentDeck = deckTab.value;
+  const currentHexSrc = hexSource.value;
+  const currentLogFilter = logFilter.value;
+  const currentCopied = copiedLog.value;
+  const currentToasts = toasts.value;
+  const allLogs = logs.value;
 
-  // Load .bin Dump for Flashing
-  const handleFileLoad = async (file) => {
-    if (!file) return;
-
-    try {
-      addLog(`Analyzing dump: ${file.name} (${file.size} B)...`);
-      const buffer = new Uint8Array(await file.arrayBuffer());
-
-      if (buffer.length !== NTAG215_SIZE) {
-        throw new Error(`Expected 540-byte dump, got ${buffer.length} bytes.`);
-      }
-
-      const parsed = parseAmiibo(buffer);
-      let meta = null;
-      if (parsed.isAmiibo && parsed.modelInfo) {
-        meta = await fetchAmiiboMetadata(parsed.modelInfo);
-      }
-
-      const staged = {
-        filename: file.name,
-        raw: buffer,
-        parsed,
-        metadata: meta,
-        error: null,
-      };
-
-      setStagedFile(staged);
-      setHexSource('staged');
-
-      const charName = meta?.name || (parsed.isAmiibo ? `${parsed.modelInfo?.seriesName} Amiibo` : 'Standard Tag');
-      addLog(`Dump Staged: ${charName} (UID: ${parsed.uidFormatted})`);
-      showToast(`Staged: ${charName}`, 'success');
-
-      setModal({
-        open: true,
-        type: 'analysis',
-        title: 'Amiibo Identified — Flash to Tag?',
-        message: '',
-        mode: 'full',
-      });
-    } catch (err) {
-      setStagedFile({
-        filename: file.name,
-        raw: null,
-        parsed: null,
-        metadata: null,
-        error: err.message,
-      });
-      addLog(`File error: ${err.message}`);
-      showToast(err.message, 'error');
-    }
-  };
-
-  const handleDrop = (e) => {
-    e.preventDefault();
-    if (e.dataTransfer.files && e.dataTransfer.files[0]) {
-      handleFileLoad(e.dataTransfer.files[0]);
-    }
-  };
-
-  // Download Active Tag .bin
-  const handleDownloadActive = () => {
-    if (!activeTag.raw || !activeTag.parsed) return;
-    const name = activeTag.metadata?.name || activeTag.parsed.modelInfo?.seriesName || 'Amiibo';
-    const cleanName = name.replace(/[^a-zA-Z0-9_\- ]/g, '').replace(/\s+/g, '_');
-    const filename = `${cleanName}_${activeTag.parsed.uidHex}.bin`;
-    downloadBin(activeTag.raw, filename);
-    addLog(`Dump exported: ${filename}`);
-    showToast(`Saved ${filename}`, 'success');
-  };
-
-  // Manual Re-Read
-  const handleRetryRead = async () => {
-    const portal = portalRef.current;
-    if (!device.connected || !portal.isConnected) return;
-    if (portal.isBusy || writing.active) return;
-
-    try {
-      setActiveTag((prev) => ({ ...prev, isReading: true }));
-      setStatus({ text: 'Re-reading tag...', type: 'info' });
-      addLog('Re-reading tag with safe pacing...');
-
-      const { found, uid } = await portal.pollOnce();
-      if (!found || !uid) {
-        throw new Error('No tag detected on portal base.');
-      }
-
-      await portal.initDance(uid);
-      const data = await portal.readTokenWithValidation((cur, tot, step) => {
-        setStatus({ text: `Reading tag: ${step} (${Math.round((cur / tot) * 100)}%)`, type: 'info' });
-      });
-
-      const parsed = parseAmiibo(data);
-      let meta = null;
-      if (parsed.isAmiibo && parsed.modelInfo) {
-        meta = await fetchAmiiboMetadata(parsed.modelInfo);
-      }
-
-      setActiveTag({
-        raw: data,
-        parsed,
-        metadata: meta,
-        isReading: false,
-      });
-
-      const charName = meta?.name || (parsed.isAmiibo ? parsed.modelInfo?.seriesName : 'NFC Tag');
-      setStatus({ text: `Tag verified: ${charName}`, type: 'success' });
-      addLog(`Read complete: ${parsed.uidFormatted} (${charName})`);
-      showToast(`Verified: ${charName}`, 'success');
-    } catch (err) {
-      setActiveTag((prev) => ({ ...prev, isReading: false }));
-      setStatus({ text: `Read failed: ${err.message}`, type: 'error' });
-      addLog(`Read error: ${err.message}`);
-      showToast(err.message, 'error');
-    }
-  };
-
-  // Confirmation Modal Trigger
-  const promptWrite = (mode) => {
-    if (!device.connected) {
-      showToast('Connect portal hardware first', 'error');
-      return;
-    }
-    if (!stagedFile.raw || !stagedFile.parsed) {
-      showToast('Stage a 540-byte .bin dump file first', 'error');
-      return;
-    }
-
-    const stagedName = stagedFile.metadata?.name || 'Amiibo dump';
-    const currentName = activeTag.metadata?.name || 'Current tag';
-
-    if (mode === 'userdata') {
-      if (!activeTag.raw) {
-        showToast('Place an Amiibo on the portal first to restore userdata', 'error');
-        return;
-      }
-      const idMatch = activeTag.parsed.modelInfo?.idHex === stagedFile.parsed.modelInfo?.idHex;
-      setModal({
-        open: true,
-        type: 'confirm',
-        mode: 'userdata',
-        title: 'Restore User Save Data Only',
-        message: idMatch
-          ? `Write user save data from "${stagedName}" to "${currentName}"? Only pages 0x04–0x81 will be written. Header, UID, and lock bytes will remain untouched.`
-          : `CAUTION: Character ID on staged file (${stagedFile.parsed.modelInfo?.idHex}) does not match tag on portal (${activeTag.parsed.modelInfo?.idHex})! Restoring mismatched user save data can invalidate cryptographic HMACs. Proceed?`,
-      });
-    } else {
-      setModal({
-        open: true,
-        type: 'confirm',
-        mode: 'full',
-        title: activeTag.raw ? 'Full Power Tag Rewrite' : 'Flash / Recover Power Tag',
-        message: activeTag.raw
-          ? `This will completely overwrite the Power Tag with "${stagedName}" (UID: ${stagedFile.parsed.uidHex}), rewriting all 135 pages (0x00 to 0x86). Ensure your tag is a rewritable Datel Power Tag (PUC). Continue?`
-          : `Ensure your Power Tag is placed on the portal base. This will execute the unlock handshake (0x1b) and write all 540 bytes of "${stagedName}", completely restoring the tag. Continue?`,
-      });
-    }
-  };
-
-  // Execute Write
-  const executeWrite = async (modeOverride) => {
-    const portal = portalRef.current;
-    const mode = modeOverride || modal.mode;
-    setModal({ open: false, type: 'confirm', title: '', message: '', mode: 'full' });
-
-    setWriting({
-      active: true,
-      progress: 0,
-      total: 100,
-      label: 'Initializing write sequence...',
-    });
-    setStatus({ text: 'Writing to tag — do not remove tag...', type: 'busy' });
-    addLog(`Starting ${mode === 'full' ? 'Full Power Tag Write' : 'Userdata Restore'}...`);
-
-    try {
-      const verifiedData = await portal.writeToken(stagedFile.raw, {
-        userdataOnly: mode === 'userdata',
-        onProgress: (cur, tot, lbl) => {
-          setWriting({
-            active: true,
-            progress: cur,
-            total: tot,
-            label: lbl,
-          });
-        },
-      });
-
-      const parsed = parseAmiibo(verifiedData);
-      setActiveTag({
-        raw: verifiedData,
-        parsed,
-        metadata: stagedFile.metadata,
-        isReading: false,
-      });
-
-      setStatus({ text: 'Write & verification successful!', type: 'success' });
-      addLog(`Write SUCCESS: Tag verified against ${stagedFile.filename}!`);
-      showToast(`Flashed "${stagedFile.metadata?.name || 'Amiibo'}" successfully!`, 'success');
-    } catch (err) {
-      setStatus({ text: `Write failed: ${err.message}`, type: 'error' });
-      addLog(`WRITE ERROR: ${err.message}`);
-      showToast(`Write error: ${err.message}`, 'error');
-    } finally {
-      setWriting({ active: false, progress: 0, total: 100, label: '' });
-    }
-  };
-
-  const filteredLogs = logs.filter((l) => {
-    if (logFilter === 'all') return true;
-    if (logFilter === 'nfc') return l.category === 'nfc';
-    if (logFilter === 'write') return l.category === 'write';
+  const filteredLogs = allLogs.filter((l) => {
+    if (currentLogFilter === 'all') return true;
+    if (currentLogFilter === 'nfc') return l.category === 'nfc';
+    if (currentLogFilter === 'write') return l.category === 'write';
     return true;
   });
 
@@ -458,7 +473,7 @@ export function App() {
     <div class="container">
       <!-- Toasts -->
       <div class="toast-container">
-        ${toasts.map(
+        ${currentToasts.map(
           (t) => html`
             <div key=${t.id} class=${`toast toast-${t.type}`}>
               <span>${t.text}</span>
@@ -478,18 +493,18 @@ export function App() {
           <div class="status-pill">
             <span
               class=${`status-dot ${
-                device.connected ? (writing.active ? 'busy' : 'connected') : ''
+                currentDev.connected ? (currentWriting.active ? 'busy' : 'connected') : ''
               }`}
             ></span>
-            <span>${status.text}</span>
+            <span>${currentStatus.text}</span>
           </div>
 
           <button
-            class=${`btn ${device.connected ? 'btn-danger' : 'btn-primary'}`}
+            class=${`btn ${currentDev.connected ? 'btn-danger' : 'btn-primary'}`}
             onClick=${handleToggleConnect}
-            disabled=${writing.active}
+            disabled=${currentWriting.active}
           >
-            ${device.connected ? 'Disconnect' : 'Connect Portal'}
+            ${currentDev.connected ? 'Disconnect' : 'Connect Portal'}
           </button>
         </div>
       </header>
@@ -500,13 +515,13 @@ export function App() {
         <div class="panel">
           <div class="panel-header">
             <span class="panel-title">Hardware Tag</span>
-            ${activeTag.raw && html`
+            ${currentActive.raw && html`
               <div style="display: flex; gap: 0.4rem;">
                 <button
                   class="btn btn-ghost"
                   style="padding: 0.25rem 0.6rem; font-size: 0.76rem;"
                   onClick=${handleRetryRead}
-                  disabled=${writing.active || activeTag.isReading}
+                  disabled=${currentWriting.active || currentActive.isReading}
                 >
                   🔄 Re-Read
                 </button>
@@ -514,7 +529,7 @@ export function App() {
                   class="btn"
                   style="padding: 0.25rem 0.65rem; font-size: 0.76rem;"
                   onClick=${handleDownloadActive}
-                  disabled=${writing.active}
+                  disabled=${currentWriting.active}
                 >
                   💾 Backup .bin
                 </button>
@@ -522,41 +537,41 @@ export function App() {
             `}
           </div>
 
-          ${activeTag.raw
+          ${currentActive.raw
             ? html`
                 <div class="tag-card">
                   <div class="tag-figure-box">
-                    ${activeTag.metadata?.imageUrl
-                      ? html`<img src=${activeTag.metadata.imageUrl} alt="Artwork" />`
+                    ${currentActive.metadata?.imageUrl
+                      ? html`<img src=${currentActive.metadata.imageUrl} alt="Artwork" />`
                       : html`<div class="tag-figure-placeholder">🎮</div>`}
                   </div>
                   <div class="tag-info-col">
                     <div class="tag-header-area">
                       <span class="tag-series">
-                        ${activeTag.parsed?.modelInfo?.seriesName || 'Amiibo'}
+                        ${currentActive.parsed?.modelInfo?.seriesName || 'Amiibo'}
                       </span>
                       <span class="tag-name">
-                        ${activeTag.metadata?.name || (activeTag.parsed?.isAmiibo ? 'Amiibo Tag' : 'NFC Tag')}
+                        ${currentActive.metadata?.name || (currentActive.parsed?.isAmiibo ? 'Amiibo Tag' : 'NFC Tag')}
                       </span>
                     </div>
 
                     <div class="tag-meta-grid">
                       <div class="meta-chip">
                         <span class="meta-chip-label">UID</span>
-                        <span class="meta-chip-val" style="color: var(--cyan);">${activeTag.parsed?.uidFormatted}</span>
+                        <span class="meta-chip-val" style="color: var(--cyan);">${currentActive.parsed?.uidFormatted}</span>
                       </div>
                       <div class="meta-chip">
                         <span class="meta-chip-label">Type</span>
-                        <span class="meta-chip-val">${activeTag.parsed?.modelInfo?.figureTypeName || 'NTAG215'}</span>
+                        <span class="meta-chip-val">${currentActive.parsed?.modelInfo?.figureTypeName || 'NTAG215'}</span>
                       </div>
-                      ${activeTag.parsed?.isAmiibo && html`
+                      ${currentActive.parsed?.isAmiibo && html`
                         <div class="meta-chip">
                           <span class="meta-chip-label">ID</span>
-                          <span class="meta-chip-val">${activeTag.parsed.modelInfo?.idHex}</span>
+                          <span class="meta-chip-val">${currentActive.parsed.modelInfo?.idHex}</span>
                         </div>
                         <div class="meta-chip">
                           <span class="meta-chip-label">Model</span>
-                          <span class="meta-chip-val">${activeTag.parsed.modelInfo?.modelNumber}</span>
+                          <span class="meta-chip-val">${currentActive.parsed.modelInfo?.modelNumber}</span>
                         </div>
                       `}
                     </div>
@@ -565,17 +580,17 @@ export function App() {
               `
             : html`
                 <div class="portal-resting-deck">
-                  <div class=${`portal-disc ${device.connected ? (activeTag.parsed?.uidHex ? 'active' : 'ready') : ''}`}>
-                    ${activeTag.parsed?.uidHex ? '⚡' : device.connected ? '📡' : '🔌'}
+                  <div class=${`portal-disc ${currentDev.connected ? (currentActive.parsed?.uidHex ? 'active' : 'ready') : ''}`}>
+                    ${currentActive.parsed?.uidHex ? '⚡' : currentDev.connected ? '📡' : '🔌'}
                   </div>
                   <div>
-                    ${activeTag.parsed?.uidHex
+                    ${currentActive.parsed?.uidHex
                       ? html`
                           <div style="font-weight: 700; color: var(--purple); font-size: 0.95rem;">
                             Power Tag Detected
                           </div>
                           <div style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--cyan); margin: 0.2rem 0;">
-                            ${activeTag.parsed.uidFormatted}
+                            ${currentActive.parsed.uidFormatted}
                           </div>
                           <div style="font-size: 0.78rem; color: var(--text-muted); margin-bottom: 0.75rem;">
                             Tag is responding on portal. You can read it or flash a fresh dump from the right.
@@ -584,17 +599,17 @@ export function App() {
                             class="btn btn-primary"
                             style="padding: 0.35rem 0.9rem; font-size: 0.8rem;"
                             onClick=${handleRetryRead}
-                            disabled=${writing.active || activeTag.isReading}
+                            disabled=${currentWriting.active || currentActive.isReading}
                           >
-                            ${activeTag.isReading ? 'Reading...' : '🔄 Read Tag'}
+                            ${currentActive.isReading ? 'Reading...' : '🔄 Read Tag'}
                           </button>
                         `
                       : html`
                           <div style="font-weight: 600; color: var(--text-heading); font-size: 0.9rem;">
-                            ${device.connected ? 'Place Tag on Portal' : 'Portal Disconnected'}
+                            ${currentDev.connected ? 'Place Tag on Portal' : 'Portal Disconnected'}
                           </div>
                           <div style="font-size: 0.78rem; color: var(--text-muted); margin-top: 0.2rem;">
-                            ${device.connected
+                            ${currentDev.connected
                               ? 'Supports retail Amiibo figures, cards, and rewritable Datel Power Tags'
                               : 'Click "Connect Portal" above to establish WebHID connection'}
                           </div>
@@ -608,7 +623,7 @@ export function App() {
         <div class="panel">
           <div class="panel-header">
             <span class="panel-title">Flash & Restore</span>
-            ${stagedFile.raw && html`
+            ${currentStaged.raw && html`
               <span style="font-size: 0.75rem; color: var(--cyan); font-weight: 600;">
                 Dump Ready
               </span>
@@ -639,31 +654,31 @@ export function App() {
           </div>
 
           <!-- Staged File Card -->
-          ${stagedFile.raw && html`
+          ${currentStaged.raw && html`
             <div class="tag-card">
               <div class="tag-figure-box">
-                ${stagedFile.metadata?.imageUrl
-                  ? html`<img src=${stagedFile.metadata.imageUrl} alt="Staged" />`
+                ${currentStaged.metadata?.imageUrl
+                  ? html`<img src=${currentStaged.metadata.imageUrl} alt="Staged" />`
                   : html`<div class="tag-figure-placeholder">💾</div>`}
               </div>
               <div class="tag-info-col">
                 <div class="tag-header-area">
                   <span class="tag-series">
-                    ${stagedFile.parsed?.modelInfo?.seriesName || 'Dump'}
+                    ${currentStaged.parsed?.modelInfo?.seriesName || 'Dump'}
                   </span>
                   <span class="tag-name">
-                    ${stagedFile.metadata?.name || 'Amiibo Dump'}
+                    ${currentStaged.metadata?.name || 'Amiibo Dump'}
                   </span>
                 </div>
 
                 <div class="tag-meta-grid">
                   <div class="meta-chip">
                     <span class="meta-chip-label">File</span>
-                    <span class="meta-chip-val" style="font-size: 0.7rem;">${stagedFile.filename}</span>
+                    <span class="meta-chip-val" style="font-size: 0.7rem;">${currentStaged.filename}</span>
                   </div>
                   <div class="meta-chip">
                     <span class="meta-chip-label">Dump UID</span>
-                    <span class="meta-chip-val" style="color: var(--cyan);">${stagedFile.parsed?.uidFormatted}</span>
+                    <span class="meta-chip-val" style="color: var(--cyan);">${currentStaged.parsed?.uidFormatted}</span>
                   </div>
                 </div>
 
@@ -673,15 +688,15 @@ export function App() {
                     class="btn btn-flash"
                     style="flex: 1;"
                     onClick=${() => promptWrite('full')}
-                    disabled=${!device.connected || !stagedFile.raw || writing.active}
+                    disabled=${!currentDev.connected || !currentStaged.raw || currentWriting.active}
                   >
-                    ${activeTag.raw ? '⚡ Flash to Power Tag' : '⚡ Flash / Recover Power Tag'}
+                    ${currentActive.raw ? '⚡ Flash to Power Tag' : '⚡ Flash / Recover Power Tag'}
                   </button>
                   <button
                     class="btn"
                     style="flex: 1;"
                     onClick=${() => promptWrite('userdata')}
-                    disabled=${!device.connected || !activeTag.raw || writing.active}
+                    disabled=${!currentDev.connected || !currentActive.raw || currentWriting.active}
                     title="Only write pages 0x04–0x81 (save data). Safe for existing retail Amiibo figures."
                   >
                     🔄 Restore Save Data
@@ -692,18 +707,18 @@ export function App() {
           `}
 
           <!-- Progress -->
-          ${writing.active && html`
+          ${currentWriting.active && html`
             <div class="progress-container">
               <div class="progress-header">
-                <span>${writing.label}</span>
+                <span>${currentWriting.label}</span>
                 <span style="font-family: var(--font-mono); color: var(--cyan);">
-                  ${Math.round((writing.progress / (writing.total || 1)) * 100)}%
+                  ${Math.round((currentWriting.progress / (currentWriting.total || 1)) * 100)}%
                 </span>
               </div>
               <div class="progress-track">
                 <div
                   class="progress-fill"
-                  style="width: ${Math.min(100, Math.round((writing.progress / (writing.total || 1)) * 100))}%;"
+                  style="width: ${Math.min(100, Math.round((currentWriting.progress / (currentWriting.total || 1)) * 100))}%;"
                 ></div>
               </div>
             </div>
@@ -716,60 +731,74 @@ export function App() {
         <div class="deck-nav">
           <div class="deck-tabs">
             <button
-              class=${`deck-tab-btn ${deckTab === 'hex' ? 'active' : ''}`}
-              onClick=${() => setDeckTab('hex')}
+              class=${`deck-tab-btn ${currentDeck === 'hex' ? 'active' : ''}`}
+              onClick=${() => {
+                deckTab.value = 'hex';
+              }}
             >
               Hex Inspector
             </button>
             <button
-              class=${`deck-tab-btn ${deckTab === 'console' ? 'active' : ''}`}
-              onClick=${() => setDeckTab('console')}
+              class=${`deck-tab-btn ${currentDeck === 'console' ? 'active' : ''}`}
+              onClick=${() => {
+                deckTab.value = 'console';
+              }}
             >
-              Activity Console (${logs.length})
+              Activity Console (${allLogs.length})
             </button>
           </div>
 
           <!-- Tab-specific toolbar actions -->
           <div style="display: flex; gap: 0.5rem; align-items: center;">
-            ${deckTab === 'hex' && html`
+            ${currentDeck === 'hex' && html`
               <div style="display: flex; gap: 0.3rem;">
                 <button
-                  class=${`btn ${hexSource === 'tag' ? 'btn-primary' : 'btn-ghost'}`}
+                  class=${`btn ${currentHexSrc === 'tag' ? 'btn-primary' : 'btn-ghost'}`}
                   style="padding: 0.2rem 0.6rem; font-size: 0.74rem;"
-                  onClick=${() => setHexSource('tag')}
+                  onClick=${() => {
+                    hexSource.value = 'tag';
+                  }}
                 >
-                  Hardware Tag (${activeTag.raw ? '540B' : 'Empty'})
+                  Hardware Tag (${currentActive.raw ? '540B' : 'Empty'})
                 </button>
                 <button
-                  class=${`btn ${hexSource === 'staged' ? 'btn-primary' : 'btn-ghost'}`}
+                  class=${`btn ${currentHexSrc === 'staged' ? 'btn-primary' : 'btn-ghost'}`}
                   style="padding: 0.2rem 0.6rem; font-size: 0.74rem;"
-                  onClick=${() => setHexSource('staged')}
+                  onClick=${() => {
+                    hexSource.value = 'staged';
+                  }}
                 >
-                  Staged Dump (${stagedFile.raw ? '540B' : 'Empty'})
+                  Staged Dump (${currentStaged.raw ? '540B' : 'Empty'})
                 </button>
               </div>
             `}
 
-            ${deckTab === 'console' && html`
+            ${currentDeck === 'console' && html`
               <div style="display: flex; gap: 0.3rem; align-items: center;">
                 <button
-                  class=${`btn ${logFilter === 'all' ? 'btn-primary' : 'btn-ghost'}`}
+                  class=${`btn ${currentLogFilter === 'all' ? 'btn-primary' : 'btn-ghost'}`}
                   style="padding: 0.2rem 0.55rem; font-size: 0.72rem;"
-                  onClick=${() => setLogFilter('all')}
+                  onClick=${() => {
+                    logFilter.value = 'all';
+                  }}
                 >
                   All
                 </button>
                 <button
-                  class=${`btn ${logFilter === 'nfc' ? 'btn-primary' : 'btn-ghost'}`}
+                  class=${`btn ${currentLogFilter === 'nfc' ? 'btn-primary' : 'btn-ghost'}`}
                   style="padding: 0.2rem 0.55rem; font-size: 0.72rem;"
-                  onClick=${() => setLogFilter('nfc')}
+                  onClick=${() => {
+                    logFilter.value = 'nfc';
+                  }}
                 >
                   NFC
                 </button>
                 <button
-                  class=${`btn ${logFilter === 'write' ? 'btn-primary' : 'btn-ghost'}`}
+                  class=${`btn ${currentLogFilter === 'write' ? 'btn-primary' : 'btn-ghost'}`}
                   style="padding: 0.2rem 0.55rem; font-size: 0.72rem;"
-                  onClick=${() => setLogFilter('write')}
+                  onClick=${() => {
+                    logFilter.value = 'write';
+                  }}
                 >
                   Writes
                 </button>
@@ -778,12 +807,14 @@ export function App() {
                   style="padding: 0.2rem 0.6rem; font-size: 0.74rem;"
                   onClick=${handleCopyLog}
                 >
-                  ${copiedLog ? '✓ Copied' : '📋 Copy'}
+                  ${currentCopied ? '✓ Copied' : '📋 Copy'}
                 </button>
                 <button
                   class="btn btn-ghost"
                   style="padding: 0.2rem 0.4rem; font-size: 0.74rem;"
-                  onClick=${() => setLogs([])}
+                  onClick=${() => {
+                    logs.value = [];
+                  }}
                 >
                   Clear
                 </button>
@@ -793,7 +824,7 @@ export function App() {
         </div>
 
         <div class="deck-content">
-          ${deckTab === 'hex' && html`
+          ${currentDeck === 'hex' && html`
             <div>
               <div class="sector-ribbon">
                 <span class="sector-chip sec-uid" title="Pages 0x00-0x03: Serial number UID, BCC, internal lock">
@@ -810,18 +841,18 @@ export function App() {
                 </span>
               </div>
               <div class="hex-box">
-                ${hexSource === 'tag'
-                  ? activeTag.raw
-                    ? formatHexDump(activeTag.raw)
+                ${currentHexSrc === 'tag'
+                  ? currentActive.raw
+                    ? formatHexDump(currentActive.raw)
                     : '// Place a tag on the portal hardware to view raw hex bytes'
-                  : stagedFile.raw
-                  ? formatHexDump(stagedFile.raw)
+                  : currentStaged.raw
+                  ? formatHexDump(currentStaged.raw)
                   : '// Stage a 540-byte .bin dump file to view raw hex bytes'}
               </div>
             </div>
           `}
 
-          ${deckTab === 'console' && html`
+          ${currentDeck === 'console' && html`
             <div class="console-box">
               ${filteredLogs.map(
                 (l) => html`
@@ -838,41 +869,45 @@ export function App() {
       </div>
 
       <!-- Confirmation / Analysis Modal -->
-      ${modal.open && html`
-        <div class="modal-overlay" onClick=${() => setModal({ open: false })}>
+      ${currentModal.open && html`
+        <div class="modal-overlay" onClick=${() => {
+          modal.value = { ...modal.value, open: false };
+        }}>
           <div class="modal-card" onClick=${(e) => e.stopPropagation()}>
             <div class="modal-header">
-              <span class="modal-title">${modal.title}</span>
+              <span class="modal-title">${currentModal.title}</span>
               <button
                 class="btn btn-ghost"
                 style="padding: 0.2rem 0.4rem; font-size: 0.9rem;"
-                onClick=${() => setModal({ open: false })}
+                onClick=${() => {
+                  modal.value = { ...modal.value, open: false };
+                }}
               >
                 ✕
               </button>
             </div>
 
             <div class="modal-body">
-              ${modal.type === 'analysis'
+              ${currentModal.type === 'analysis'
                 ? html`
                     <div style="display: flex; gap: 1.15rem; align-items: center; margin-bottom: 0.85rem;">
                       <div class="tag-figure-box" style="width: 85px; height: 110px;">
-                        ${stagedFile.metadata?.imageUrl
-                          ? html`<img src=${stagedFile.metadata.imageUrl} alt="Artwork" />`
+                        ${currentStaged.metadata?.imageUrl
+                          ? html`<img src=${currentStaged.metadata.imageUrl} alt="Artwork" />`
                           : html`<div class="tag-figure-placeholder">💾</div>`}
                       </div>
                       <div style="flex: 1;">
                         <div style="font-size: 1.15rem; font-weight: 700; color: var(--text-heading);">
-                          ${stagedFile.metadata?.name || 'Amiibo Dump'}
+                          ${currentStaged.metadata?.name || 'Amiibo Dump'}
                         </div>
                         <div style="font-size: 0.78rem; color: var(--cyan); margin-bottom: 0.4rem;">
-                          ${stagedFile.parsed?.modelInfo?.seriesName}
+                          ${currentStaged.parsed?.modelInfo?.seriesName}
                         </div>
                         <div style="font-family: var(--font-mono); font-size: 0.74rem; color: var(--text-muted);">
-                          UID: ${stagedFile.parsed?.uidFormatted}
+                          UID: ${currentStaged.parsed?.uidFormatted}
                         </div>
                         <div style="font-family: var(--font-mono); font-size: 0.74rem; color: var(--text-muted);">
-                          ID: ${stagedFile.parsed?.modelInfo?.idHex}
+                          ID: ${currentStaged.parsed?.modelInfo?.idHex}
                         </div>
                       </div>
                     </div>
@@ -886,17 +921,19 @@ export function App() {
                   `
                 : html`
                     <div class="modal-callout">
-                      <div>${modal.message}</div>
+                      <div>${currentModal.message}</div>
                     </div>
                   `}
             </div>
 
             <div class="modal-actions">
-              <button class="btn btn-ghost" onClick=${() => setModal({ open: false })}>
+              <button class="btn btn-ghost" onClick=${() => {
+                modal.value = { ...modal.value, open: false };
+              }}>
                 Cancel
               </button>
-              <button class="btn btn-flash" onClick=${() => executeWrite(modal.mode)}>
-                ${modal.mode === 'userdata' ? 'Restore Save Data' : 'Flash Tag Now'}
+              <button class="btn btn-flash" onClick=${() => executeWrite(currentModal.mode)}>
+                ${currentModal.mode === 'userdata' ? 'Restore Save Data' : 'Flash Tag Now'}
               </button>
             </div>
           </div>

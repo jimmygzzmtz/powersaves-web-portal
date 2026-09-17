@@ -28,8 +28,17 @@ Built with **Preact 11 (`preact@11.0.0-rc.2`)** and **HTM** using native browser
 ---
 
 ## 🚀 Quick Start (Zero Build Step)
+## 🌐 Try It Out (Live on GitHub Pages)
 
 Since the app uses native browser ES Module import maps with Preact 11 and HTM from `esm.sh`, there is no `npm install` or build step needed.
+You can try the portal directly in your browser without installing anything:
+👉 **[https://jimmygzzmtz.github.io/powersaves-web-portal/](https://jimmygzzmtz.github.io/powersaves-web-portal/)**
+
+---
+
+## 🚀 Running Locally (Zero Build Step)
+
+Since the app uses native browser ES Module import maps with Preact 11 and Preact Signals from `esm.sh`, there is no `npm install` or build step needed.
 
 Simply serve the repository folder over HTTP/HTTPS:
 
