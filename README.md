@@ -89,7 +89,7 @@ This project builds directly upon the reverse-engineering research and open-sour
 
 ## 📄 License
 
-MIT License — see [LICENSE](LICENSE) for details.
+MIT License — see [LICENSE](LICENSE.txt) for details.
 
 Copyright (c) 2026 jimmygzzmtz
 
